@@ -23,3 +23,16 @@ pub fn install() {
 pub fn requested() -> bool {
     REQUESTED.load(Ordering::Relaxed)
 }
+
+/// Waits, but stays responsive to Ctrl+C. False when the wait was cut short.
+pub fn sleep(total: std::time::Duration) -> bool {
+    const STEP: std::time::Duration = std::time::Duration::from_millis(100);
+    let deadline = std::time::Instant::now() + total;
+    while std::time::Instant::now() < deadline {
+        if requested() {
+            return false;
+        }
+        std::thread::sleep(STEP.min(deadline - std::time::Instant::now()));
+    }
+    !requested()
+}

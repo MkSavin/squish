@@ -20,6 +20,7 @@ squish: 14 file(s), 2 job(s), gpu NVENC (NVIDIA GeForce RTX 4070 Ti)
   IMG_0307.MOV  phone  41.9 MiB -> 5.5 MiB (-86.9%)
   IMG_0308.MOV  phone  41.9 MiB -> 5.5 MiB (-86.9%)
   IMG_0309.MOV  phone  79.3 MiB -> 91.3 MiB (+15.1%)  (larger than the source, kept)
+  clip-2019.mp4        skipped: already h264 at 0.031 bits/pixel
   broken.MOV           err: moov atom not found
   IMG_0310.MOV  phone  [====================    ]   83%   0.4x  hevc aac (apple_apac dropped)
   IMG_0311.MOV  web    [=====                   ]   21%   2.1x  h264 aac
@@ -49,10 +50,19 @@ cleaning up after a failure, and adding up what you saved.
 - **Parallel encodes** — two at a time by default, `-j 4` for more.
 - **Its own globbing** — `squish *.mov` works in cmd and PowerShell, which never
   expand patterns themselves.
+- **Every result is checked** — ffmpeg can exit cleanly on a file that stops
+  halfway or lost its sound. squish reads each output back and measures it
+  against the source, so a short encode is a failure, not a green tick.
+- **Nothing pointless gets re-encoded** — a file already light for its codec is
+  left alone instead of being run through the encoder to come out worse.
+- **Whole trees** — `-r` walks subdirectories, and `--out-dir` rebuilds the same
+  folder structure on the other side.
+- **Dates survive** — the output keeps its source's timestamp, so a re-encoded
+  library sorts the way it did before.
 - **Never touches the source** — output is `<name>.squish.mp4` next to it, a
   half-written file is deleted when ffmpeg fails, and one bad file does not stop
   the queue. `--trash-originals` is the one exception, and it only moves sources
-  that produced a file in this very run, to the trash rather than nowhere.
+  that produced a *verified* file in this very run, to the trash rather than nowhere.
 - **Ctrl+C means stop** — squish kills the ffmpeg processes it started instead of
   leaving them running with nobody watching, and removes their half-written files.
 - **Correct containers** — `hvc1` / `av01` tags, `+faststart`, so QuickTime and
@@ -73,6 +83,12 @@ binary somewhere on your `PATH`.
 | macOS Apple Silicon | `squish-<version>-aarch64-apple-darwin.tar.gz` |
 
 Every archive ships with a `.sha256` next to it.
+
+### Package managers
+
+Manifests for Scoop, Homebrew and winget live in [`packaging/`](packaging), ready
+to submit — none of them is published yet, because there is no release to point
+at. [`packaging/README.md`](packaging/README.md) has the steps.
 
 ### From source
 
@@ -120,6 +136,12 @@ Three at a time, into a separate folder:
 
 ```bash
 squish -j 3 --out-dir compressed *.mp4
+```
+
+A whole tree, rebuilt under `compressed/`:
+
+```bash
+squish -r --out-dir compressed
 ```
 
 One file, one name:
@@ -170,6 +192,7 @@ A profile only fills in what you left out, so `-p archive -q 30` keeps hevc,
 | `-c, --codec <CODEC>` | `h264`, `hevc`, `av1` |
 | `-p, --profile <NAME>` | one of the profiles above |
 | `-j, --jobs <N>` | encode N files at once [default: 2] |
+| `-r, --recursive` | look in subdirectories too |
 | `-o, --output <FILE>` | name the result; single input only |
 | `--out-dir <DIR>` | write outputs here instead of next to the source |
 | `--ten-bit` | keep 10-bit depth when the source has it |
@@ -178,7 +201,8 @@ A profile only fills in what you left out, so `-p archive -q 30` keeps hevc,
 | `--trash-originals` | move every source re-encoded in this run to the trash |
 | `--raw` | let ffmpeg write to the terminal itself; implies `-j 1` |
 | `--quiet` | print nothing but the path of every file written |
-| `--force` | overwrite existing outputs |
+| `--force` | overwrite existing outputs, and encode files that are already small |
+| `--no-verify` | do not read the outputs back to check them |
 | `--dry-run` | print the ffmpeg commands and stop |
 | `--keep-metadata` | carry over container metadata and the capture timestamp |
 
@@ -195,8 +219,18 @@ A profile only fills in what you left out, so `-p archive -q 30` keeps hevc,
 - **Subtitles, chapters and data streams are dropped.** Audio becomes AAC 192k.
 - **An output larger than its source is kept** and flagged in the summary. This
   is what `auto` exists to avoid: h264 on a 10-bit phone clip regularly grows it.
+- **Every output is measured against its source.** ffmpeg returns 0 on a file
+  that stopped early — a source truncated on disk still states its full length in
+  the header, so the encode looks like a 45% saving and is really a 66% loss.
+  squish compares the length and the presence of audio, and a mismatch is a
+  failure with the output deleted. `--no-verify` turns the check off.
+- **A file already light for its codec is skipped.** Below roughly 0.06 bits per
+  pixel for h264, 0.04 for hevc, 0.03 for av1, and in a codec no weaker than the
+  target, re-encoding only loses quality. `--force` does it anyway.
+- **Outputs inherit the source's timestamp**, so a re-encoded library keeps its
+  order. `--keep-metadata` is about the tags *inside* the file, and stays opt-in.
 - **`--trash-originals` skips anything that failed, was skipped, or was
-  interrupted.** A file only goes to the trash once a real output exists for it.
+  interrupted.** A file only goes to the trash once a verified output exists for it.
 
 ## Releasing
 
@@ -225,6 +259,12 @@ cargo test
 cargo clippy --all-targets -- -D warnings
 cargo build --release
 ```
+
+`tests/e2e.rs` encodes real files with the ffmpeg on your `PATH` — a folder run,
+a truncated source, recursion into `--out-dir`, a broken file, `--dry-run` and
+`--quiet`. Without ffmpeg those tests print a line and skip themselves; CI
+installs it on Windows, Linux and macOS, which is where the VideoToolbox path
+gets exercised.
 
 ## License
 

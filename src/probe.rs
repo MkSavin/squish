@@ -15,6 +15,10 @@ pub struct Source {
     pub bit_depth: Option<u32>,
     pub creation_time: Option<String>,
     pub duration: Option<f64>,
+    pub width: Option<u32>,
+    pub height: Option<u32>,
+    pub fps: Option<f64>,
+    pub bit_rate: Option<u64>,
     /// Index among the audio streams, `None` when there is nothing usable.
     pub audio_stream: Option<usize>,
     pub dropped_audio: Vec<String>,
@@ -27,6 +31,17 @@ pub struct Source {
 impl Source {
     pub fn is_ten_bit(&self) -> bool {
         self.bit_depth.is_some_and(|d| d >= 10)
+    }
+
+    /// Bits per pixel per frame: how heavy the file is, independent of its size
+    /// and frame rate. `bytes` stands in when the container states no bitrate.
+    pub fn bits_per_pixel(&self, bytes: u64) -> Option<f64> {
+        let pixels = f64::from(self.width?) * f64::from(self.height?) * self.fps?;
+        let bits = match self.bit_rate {
+            Some(rate) => rate as f64,
+            None => bytes as f64 * 8.0 / self.duration?,
+        };
+        (pixels > 0.0 && bits.is_finite()).then(|| bits / pixels)
     }
 }
 
@@ -44,11 +59,17 @@ struct ProbeStream {
     codec_name: Option<String>,
     pix_fmt: Option<String>,
     bits_per_raw_sample: Option<String>,
+    width: Option<u32>,
+    height: Option<u32>,
+    r_frame_rate: Option<String>,
+    avg_frame_rate: Option<String>,
+    bit_rate: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
 struct ProbeFormat {
     duration: Option<String>,
+    bit_rate: Option<String>,
     #[serde(default)]
     tags: HashMap<String, String>,
 }
@@ -75,6 +96,32 @@ pub fn probe(input: &Path) -> Result<Source> {
     let parsed: ProbeOutput =
         serde_json::from_slice(&output.stdout).context("ffprobe returned unreadable json")?;
     parse_probe(parsed, ffmpeg::decoders())
+}
+
+/// ffmpeg can exit cleanly on a file that is short or silent, so the result is
+/// read back and measured against the source before anything trusts it.
+pub fn verify(output: &Path, source: &Source) -> Result<()> {
+    let written = probe(output).context("the output cannot be read back")?;
+    match compare(source, &written) {
+        Some(problem) => bail!("{problem}"),
+        None => Ok(()),
+    }
+}
+
+const DURATION_TOLERANCE: f64 = 0.01;
+const DURATION_SLACK: f64 = 0.5;
+
+fn compare(source: &Source, output: &Source) -> Option<String> {
+    if source.audio_stream.is_some() && output.audio_stream.is_none() {
+        return Some("the output has no audio, the source had some".into());
+    }
+    let expected = source.duration?;
+    let Some(written) = output.duration else {
+        return Some("the output states no duration".into());
+    };
+    let allowed = (expected * DURATION_TOLERANCE).max(DURATION_SLACK);
+    ((written - expected).abs() > allowed)
+        .then(|| format!("the output is {written:.1}s long, the source {expected:.1}s"))
 }
 
 fn parse_probe(parsed: ProbeOutput, decoders: Option<&HashSet<String>>) -> Result<Source> {
@@ -105,6 +152,19 @@ fn parse_probe(parsed: ProbeOutput, decoders: Option<&HashSet<String>>) -> Resul
         screen_like: pix_fmt.as_deref().is_some_and(looks_like_a_screen),
         pix_fmt,
         bit_depth,
+        width: video.width,
+        height: video.height,
+        fps: video
+            .avg_frame_rate
+            .as_deref()
+            .and_then(parse_frame_rate)
+            .or_else(|| video.r_frame_rate.as_deref().and_then(parse_frame_rate)),
+        bit_rate: video
+            .bit_rate
+            .as_deref()
+            .or_else(|| parsed.format.as_ref().and_then(|f| f.bit_rate.as_deref()))
+            .and_then(|r| r.parse().ok())
+            .filter(|r: &u64| *r > 0),
         duration: parsed
             .format
             .as_ref()
@@ -138,6 +198,16 @@ fn written_by_a_phone(tags: &HashMap<String, String>) -> bool {
         let key = key.to_ascii_lowercase();
         key.starts_with("com.apple.quicktime.") || key.starts_with("com.android.")
     })
+}
+
+/// ffprobe writes frame rates as a fraction, e.g. `30000/1001`.
+fn parse_frame_rate(raw: &str) -> Option<f64> {
+    let (numerator, denominator) = match raw.split_once('/') {
+        Some((n, d)) => (n.parse::<f64>().ok()?, d.parse::<f64>().ok()?),
+        None => (raw.parse::<f64>().ok()?, 1.0),
+    };
+    let fps = numerator / denominator;
+    (fps.is_finite() && fps > 0.0).then_some(fps)
 }
 
 fn looks_like_a_screen(pix_fmt: &str) -> bool {
@@ -288,6 +358,104 @@ mod tests {
         assert_eq!(source.creation_time, None);
         assert_eq!(source.duration, None);
         assert_eq!(source.audio_stream, None);
+    }
+
+    #[test]
+    fn frame_rates_are_fractions() {
+        assert_eq!(parse_frame_rate("30"), Some(30.0));
+        assert_eq!(parse_frame_rate("60/1"), Some(60.0));
+        assert!((parse_frame_rate("30000/1001").unwrap() - 29.97).abs() < 0.01);
+        assert_eq!(parse_frame_rate("0/0"), None);
+        assert_eq!(parse_frame_rate("junk"), None);
+    }
+
+    #[test]
+    fn geometry_and_bitrate_come_off_the_video_stream() {
+        let source = from_json(
+            r#"{
+                "streams": [{"codec_type": "video", "codec_name": "h264", "pix_fmt": "yuv420p",
+                             "width": 1920, "height": 1080, "avg_frame_rate": "30000/1001",
+                             "bit_rate": "5000000"}],
+                "format": {"duration": "60", "bit_rate": "5200000"}
+            }"#,
+        )
+        .unwrap();
+        assert_eq!(source.width, Some(1920));
+        assert_eq!(source.height, Some(1080));
+        assert_eq!(source.bit_rate, Some(5_000_000));
+        let bpp = source.bits_per_pixel(0).unwrap();
+        assert!((bpp - 0.0804).abs() < 0.001, "{bpp}");
+    }
+
+    #[test]
+    fn the_container_bitrate_and_then_the_file_size_stand_in() {
+        let from_format = from_json(
+            r#"{
+                "streams": [{"codec_type": "video", "pix_fmt": "yuv420p", "width": 100,
+                             "height": 100, "avg_frame_rate": "10"}],
+                "format": {"duration": "10", "bit_rate": "100000"}
+            }"#,
+        )
+        .unwrap();
+        assert_eq!(from_format.bit_rate, Some(100_000));
+        assert_eq!(from_format.bits_per_pixel(0), Some(1.0));
+
+        let from_size = from_json(
+            r#"{
+                "streams": [{"codec_type": "video", "pix_fmt": "yuv420p", "width": 100,
+                             "height": 100, "avg_frame_rate": "10"}],
+                "format": {"duration": "10"}
+            }"#,
+        )
+        .unwrap();
+        assert_eq!(from_size.bit_rate, None);
+        assert_eq!(from_size.bits_per_pixel(125_000), Some(1.0));
+    }
+
+    #[test]
+    fn a_file_without_geometry_has_no_weight() {
+        let source = from_json(
+            r#"{"streams": [{"codec_type": "video", "pix_fmt": "yuv420p"}], "format": {}}"#,
+        )
+        .unwrap();
+        assert_eq!(source.bits_per_pixel(1_000_000), None);
+    }
+
+    fn lasting(seconds: f64) -> Source {
+        Source {
+            duration: Some(seconds),
+            ..Source::default()
+        }
+    }
+
+    #[test]
+    fn an_output_of_the_right_length_passes() {
+        assert_eq!(compare(&lasting(60.0), &lasting(60.0)), None);
+        assert_eq!(compare(&lasting(60.0), &lasting(59.5)), None);
+        assert_eq!(compare(&lasting(2.0), &lasting(2.4)), None);
+    }
+
+    #[test]
+    fn a_truncated_output_is_caught() {
+        let problem = compare(&lasting(60.0), &lasting(12.0)).unwrap();
+        assert!(problem.contains("12.0s long"), "{problem}");
+        assert!(compare(&lasting(60.0), &Source::default()).is_some());
+    }
+
+    #[test]
+    fn an_output_that_lost_its_audio_is_caught() {
+        let source = Source {
+            audio_stream: Some(0),
+            ..lasting(10.0)
+        };
+        assert!(compare(&source, &lasting(10.0)).is_some());
+        assert_eq!(compare(&source, &source), None);
+        assert_eq!(compare(&lasting(10.0), &source), None);
+    }
+
+    #[test]
+    fn a_source_of_unknown_length_cannot_be_measured() {
+        assert_eq!(compare(&Source::default(), &Source::default()), None);
     }
 
     #[test]

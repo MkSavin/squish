@@ -55,6 +55,10 @@ pub struct Cli {
     #[arg(long, value_name = "P", value_parser = parse_preset)]
     pub preset: Option<Preset>,
 
+    /// Look in subdirectories too
+    #[arg(short = 'r', long)]
+    pub recursive: bool,
+
     /// Files to encode at the same time
     #[arg(
         short = 'j',
@@ -85,9 +89,13 @@ pub struct Cli {
     #[arg(long)]
     pub trash_originals: bool,
 
-    /// Overwrite existing outputs
+    /// Overwrite existing outputs, and encode files that are already small
     #[arg(long)]
     pub force: bool,
+
+    /// Do not read the outputs back to check their length and audio
+    #[arg(long)]
+    pub no_verify: bool,
 
     /// Print the ffmpeg commands without running them
     #[arg(long)]
@@ -156,10 +164,14 @@ pub struct Config {
     pub jobs: usize,
     pub output: Option<PathBuf>,
     pub out_dir: Option<PathBuf>,
+    /// Directory the inputs share, so `--out-dir` can mirror their tree.
+    pub out_base: Option<PathBuf>,
+    pub recursive: bool,
     pub raw: bool,
     pub quiet: bool,
     pub trash_originals: bool,
     pub force: bool,
+    pub verify: bool,
     pub dry_run: bool,
     pub keep_metadata: bool,
 }
@@ -275,10 +287,13 @@ impl Cli {
             jobs: if self.raw { 1 } else { self.jobs as usize },
             output: self.output,
             out_dir: self.out_dir,
+            out_base: None,
+            recursive: self.recursive,
             raw: self.raw,
             quiet: self.quiet,
             trash_originals: self.trash_originals,
             force: self.force,
+            verify: !self.no_verify,
             dry_run: self.dry_run,
             keep_metadata: self.keep_metadata,
         };
@@ -358,6 +373,56 @@ impl Codec {
 
     pub fn supports_ten_bit(self) -> bool {
         !matches!(self, Codec::H264)
+    }
+
+    /// What ffprobe calls the codec, for the ones squish can also produce.
+    fn from_stream(name: &str) -> Option<Codec> {
+        match name {
+            "h264" | "avc1" => Some(Codec::H264),
+            "hevc" | "h265" => Some(Codec::Hevc),
+            "av1" => Some(Codec::Av1),
+            _ => None,
+        }
+    }
+
+    /// How much a codec squeezes out of the same bits.
+    fn rank(self) -> u8 {
+        match self {
+            Codec::H264 => 0,
+            Codec::Hevc => 1,
+            Codec::Av1 => 2,
+        }
+    }
+
+    /// Bits per pixel below which this codec is already at its useful limit.
+    fn bpp_floor(self) -> f64 {
+        match self {
+            Codec::H264 => 0.06,
+            Codec::Hevc => 0.04,
+            Codec::Av1 => 0.03,
+        }
+    }
+}
+
+impl Plan {
+    /// A file already light, in a codec no worse than the target, only loses
+    /// quality on the way through.
+    pub fn pointless_for(&self, source: &Source, bytes: u64) -> Option<String> {
+        let current = Codec::from_stream(source.video_codec.as_deref()?)?;
+        if current.rank() < self.codec.rank() {
+            return None;
+        }
+        let bpp = source.bits_per_pixel(bytes)?;
+        (bpp < self.codec.bpp_floor()).then(|| {
+            let weight = match bpp < 0.001 {
+                true => "under 0.001".to_owned(),
+                false => format!("{bpp:.3}"),
+            };
+            format!(
+                "already {} at {weight} bits/pixel",
+                source.video_codec.as_deref().unwrap_or("encoded")
+            )
+        })
     }
 }
 
@@ -640,6 +705,80 @@ mod tests {
     fn trashing_originals_is_off_unless_asked_for() {
         assert!(!config(&[]).unwrap().trash_originals);
         assert!(config(&["--trash-originals"]).unwrap().trash_originals);
+    }
+
+    fn already_small(codec: &str, bit_rate: u64) -> Source {
+        Source {
+            video_codec: Some(codec.into()),
+            width: Some(1920),
+            height: Some(1080),
+            fps: Some(30.0),
+            bit_rate: Some(bit_rate),
+            ..plain()
+        }
+    }
+
+    #[test]
+    fn a_lean_file_in_the_same_codec_is_not_worth_redoing() {
+        // 1080p30 at 2 Mbit/s is 0.032 bits per pixel.
+        let plan = plan(&["-c", "hevc"], &plain());
+        let reason = plan
+            .pointless_for(&already_small("hevc", 2_000_000), 0)
+            .unwrap();
+        assert!(reason.contains("already hevc"), "{reason}");
+        assert!(reason.contains("0.032"), "{reason}");
+    }
+
+    #[test]
+    fn a_nearly_empty_file_does_not_read_as_zero() {
+        let plan = plan(&["-c", "h264"], &plain());
+        let reason = plan
+            .pointless_for(&already_small("h264", 20_000), 0)
+            .unwrap();
+        assert!(reason.contains("under 0.001"), "{reason}");
+    }
+
+    #[test]
+    fn a_fat_file_is_always_worth_redoing() {
+        let plan = plan(&["-c", "hevc"], &plain());
+        assert_eq!(
+            plan.pointless_for(&already_small("hevc", 20_000_000), 0),
+            None
+        );
+    }
+
+    #[test]
+    fn a_lean_file_in_a_weaker_codec_still_gets_encoded() {
+        let to_hevc = plan(&["-c", "hevc"], &plain());
+        assert_eq!(
+            to_hevc.pointless_for(&already_small("h264", 2_000_000), 0),
+            None
+        );
+
+        let to_h264 = plan(&["-c", "h264"], &plain());
+        assert!(to_h264
+            .pointless_for(&already_small("hevc", 2_000_000), 0)
+            .is_some());
+    }
+
+    #[test]
+    fn a_codec_squish_cannot_produce_is_never_left_alone() {
+        let plan = plan(&["-c", "hevc"], &plain());
+        assert_eq!(plan.pointless_for(&already_small("prores", 1), 0), None);
+        assert_eq!(plan.pointless_for(&plain(), 0), None);
+    }
+
+    #[test]
+    fn verification_is_on_unless_waived() {
+        assert!(config(&[]).unwrap().verify);
+        assert!(!config(&["--no-verify"]).unwrap().verify);
+    }
+
+    #[test]
+    fn recursion_is_opt_in() {
+        assert!(!config(&[]).unwrap().recursive);
+        assert!(config(&["-r"]).unwrap().recursive);
+        assert!(config(&["--recursive"]).unwrap().recursive);
     }
 
     #[test]

@@ -194,7 +194,7 @@ fn process(
 
     let output = match &config.output {
         Some(path) => path.clone(),
-        None => expand::output_path(input, config.out_dir.as_deref())?,
+        None => expand::output_path(input, config.out_dir.as_deref(), config.out_base.as_deref())?,
     };
     if same_file(input, &output) {
         bail!("output {} would overwrite the source", output.display());
@@ -209,6 +209,14 @@ fn process(
     let source =
         probe::probe(input).with_context(|| format!("cannot probe {}", input.display()))?;
     let plan = config.plan_for(&source);
+    ffmpeg::check_encoder(&plan)?;
+
+    let before = file_size(input)?;
+    if !config.force {
+        if let Some(reason) = plan.pointless_for(&source, before) {
+            return Ok(Step::Skipped(reason));
+        }
+    }
     if plan.ten_bit && !source.is_ten_bit() {
         note(format!(
             "source is {} bit, encoding 8 bit",
@@ -220,8 +228,11 @@ fn process(
         println!("  {}", ffmpeg::display_command(&args));
         return Ok(Step::Skipped("dry run".into()));
     }
+    if let Some(parent) = output.parent().filter(|p| !p.as_os_str().is_empty()) {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("cannot create {}", parent.display()))?;
+    }
 
-    let before = file_size(input)?;
     let _ = tx.send(Event::Started {
         index,
         profile: plan.profile.name().to_owned(),
@@ -229,14 +240,7 @@ fn process(
         duration: source.duration,
     });
 
-    let encoded = if config.raw {
-        ffmpeg::run(&args)
-    } else {
-        ffmpeg::run_watched(&ffmpeg::with_progress(&args), |tick| {
-            let _ = tx.send(Event::Progress { index, tick });
-        })
-    };
-    match encoded {
+    match encode(index, &args, config, tx, &note) {
         Err(error) => {
             discard_partial(&output, &note);
             return Err(error).with_context(|| format!("encoding {}", input.display()));
@@ -248,12 +252,70 @@ fn process(
         Ok(ffmpeg::Completion::Finished) => {}
     }
 
+    if config.verify {
+        if let Err(error) = probe::verify(&output, &source) {
+            discard_partial(&output, &note);
+            return Err(error).with_context(|| format!("checking {}", output.display()));
+        }
+    }
+    copy_timestamp(input, &output, &note);
+
     let after = file_size(&output)?;
     *written = Some(output);
     Ok(Step::Encoded {
         input: before,
         output: after,
     })
+}
+
+const BUSY_RETRIES: u32 = 3;
+const BUSY_WAIT: Duration = Duration::from_secs(3);
+
+/// A GPU with every encoder session taken frees one as soon as a neighbour
+/// finishes, so the file waits instead of failing.
+fn encode(
+    index: usize,
+    args: &[std::ffi::OsString],
+    config: &Config,
+    tx: &Sender<Event>,
+    note: &dyn Fn(String),
+) -> Result<ffmpeg::Completion> {
+    let with_progress = ffmpeg::with_progress(args);
+    for attempt in 1..=BUSY_RETRIES {
+        let result = if config.raw {
+            ffmpeg::run(args)
+        } else {
+            ffmpeg::run_watched(&with_progress, |tick| {
+                let _ = tx.send(Event::Progress { index, tick });
+            })
+        };
+        match result {
+            Err(error) if attempt < BUSY_RETRIES && ffmpeg::is_busy(&error) => {
+                note(format!("{}, waiting", ffmpeg::BUSY));
+                if !shutdown::sleep(BUSY_WAIT) {
+                    return Ok(ffmpeg::Completion::Interrupted);
+                }
+            }
+            other => return other,
+        }
+    }
+    unreachable!("the last attempt returns")
+}
+
+/// Keeps the result sorted next to its neighbours: a re-encode is the same
+/// recording, not a new one.
+fn copy_timestamp(input: &Path, output: &Path, note: &dyn Fn(String)) {
+    let stamped = fs::metadata(input)
+        .and_then(|meta| meta.modified())
+        .and_then(|time| {
+            fs::File::options()
+                .write(true)
+                .open(output)
+                .and_then(|file| file.set_modified(time))
+        });
+    if let Err(error) = stamped {
+        note(format!("cannot copy the timestamp: {error}"));
+    }
 }
 
 /// What the output will hold, plus anything of the input that had to go.

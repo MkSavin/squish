@@ -30,11 +30,12 @@ fn main() -> ExitCode {
 }
 
 fn execute() -> Result<bool> {
-    let (patterns, config) = Cli::parse().resolve()?;
+    let (patterns, mut config) = Cli::parse().resolve()?;
     ffmpeg::preflight()?;
     shutdown::install();
 
-    let inputs = collect(&patterns)?;
+    let inputs = collect(&patterns, config.recursive)?;
+    config.out_base = expand::common_base(&inputs);
     if config.output.is_some() && inputs.len() > 1 {
         bail!(
             "--output names one file, but {} matched; use --out-dir instead",
@@ -71,17 +72,21 @@ fn execute() -> Result<bool> {
 }
 
 /// No patterns at all means "every video in this directory".
-fn collect(patterns: &[String]) -> Result<Vec<PathBuf>> {
+fn collect(patterns: &[String], recursive: bool) -> Result<Vec<PathBuf>> {
     if patterns.is_empty() {
         let here = std::env::current_dir().context("cannot read the current directory")?;
-        let files = expand::videos_in(&here)?;
+        let files = expand::videos_in(&here, recursive)?;
         if files.is_empty() {
             bail!("no video files in {}", here.display());
         }
         return Ok(files);
     }
 
-    let files = expand::expand_patterns(patterns)?;
+    let widened: Vec<String> = match recursive {
+        true => patterns.iter().map(|p| expand::into_recursive(p)).collect(),
+        false => patterns.to_vec(),
+    };
+    let files = expand::expand_patterns(&widened)?;
     if files.is_empty() {
         bail!("no files matched {}", patterns.join(", "));
     }

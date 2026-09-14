@@ -58,6 +58,39 @@ pub fn decoders() -> Option<&'static HashSet<String>> {
         .as_ref()
 }
 
+/// Encoder names this ffmpeg build carries, queried once.
+pub fn encoders() -> Option<&'static HashSet<String>> {
+    static ENCODERS: OnceLock<Option<HashSet<String>>> = OnceLock::new();
+    ENCODERS
+        .get_or_init(|| {
+            let output = Command::new(FFMPEG)
+                .args(["-hide_banner", "-encoders"])
+                .stdin(Stdio::null())
+                .output()
+                .ok()?;
+            output
+                .status
+                .success()
+                .then(|| parse_decoders(&String::from_utf8_lossy(&output.stdout)))
+        })
+        .as_ref()
+}
+
+/// Told before any file is touched, rather than as a wall of ffmpeg output.
+pub fn check_encoder(plan: &Plan) -> Result<()> {
+    let encoder = plan.codec.encoder(plan.backend);
+    let Some(known) = encoders() else {
+        return Ok(());
+    };
+    if known.contains(encoder) {
+        return Ok(());
+    }
+    match plan.backend {
+        Backend::Cpu => bail!("this ffmpeg build has no {encoder}"),
+        _ => bail!("this ffmpeg build has no {encoder}; --cpu encodes without it"),
+    }
+}
+
 /// Lines look like ` A....D aac  AAC (Advanced Audio Coding)`.
 fn parse_decoders(listing: &str) -> HashSet<String> {
     listing
@@ -280,6 +313,39 @@ pub fn run_watched(args: &[OsString], mut on_tick: impl FnMut(Tick)) -> Result<C
     Ok(Completion::Finished)
 }
 
+/// Said when every hardware encoder session is taken; the file is worth retrying.
+pub const BUSY: &str = "no free encoder session on the GPU";
+
+/// ffmpeg states these as driver internals, which says nothing about what to do.
+fn hint(stderr: &str) -> Option<&'static str> {
+    const PATTERNS: [(&str, &str); 5] = [
+        ("openencodesessionex failed", BUSY),
+        ("incompatible client key", BUSY),
+        (
+            "does not support the required nvenc api",
+            "the GPU driver is older than this ffmpeg build expects; update it or use --cpu",
+        ),
+        (
+            "cannot load nvencodeapi",
+            "no NVENC driver was found; --cpu encodes without a GPU",
+        ),
+        (
+            "no nvenc capable devices found",
+            "NVENC refused the input; this is usually an unsupported pixel format or a busy GPU",
+        ),
+    ];
+    let lowered = stderr.to_lowercase();
+    PATTERNS
+        .iter()
+        .find(|(pattern, _)| lowered.contains(pattern))
+        .map(|(_, hint)| *hint)
+}
+
+/// Whether the same file is worth another go in a moment.
+pub fn is_busy(error: &anyhow::Error) -> bool {
+    format!("{error:#}").contains(BUSY)
+}
+
 fn check(code: Option<i32>, success: bool, stderr: Option<&str>) -> Result<()> {
     if success {
         return Ok(());
@@ -288,9 +354,12 @@ fn check(code: Option<i32>, success: bool, stderr: Option<&str>) -> Result<()> {
         Some(code) => format!("ffmpeg exited with code {code}"),
         None => "ffmpeg was terminated by a signal".to_owned(),
     };
-    match stderr.map(str::trim).filter(|s| !s.is_empty()) {
-        Some(text) => bail!("{reason}: {}", last_lines(text, 3)),
-        None => bail!("{reason}"),
+    let Some(text) = stderr.map(str::trim).filter(|s| !s.is_empty()) else {
+        bail!("{reason}");
+    };
+    match hint(text) {
+        Some(hint) => bail!("{hint} ({})", last_lines(text, 2)),
+        None => bail!("{reason}: {}", last_lines(text, 3)),
     }
 }
 
@@ -636,5 +705,34 @@ mod tests {
         assert!(text.contains("code 1"));
         assert!(text.contains("two; three; four"));
         assert!(!text.contains("one;"));
+    }
+
+    #[test]
+    fn driver_complaints_are_translated() {
+        let cases = [
+            (
+                "[hevc_nvenc @ 0x1] Driver does not support the required nvenc API version",
+                "update it",
+            ),
+            (
+                "[h264_nvenc @ 0x1] OpenEncodeSessionEx failed: out of memory (10)",
+                BUSY,
+            ),
+            ("Cannot load nvEncodeAPI64.dll", "--cpu"),
+            ("[h264_nvenc @ 0x1] No NVENC capable devices found", "NVENC"),
+        ];
+        for (stderr, expected) in cases {
+            let text = check(Some(1), false, Some(stderr)).unwrap_err().to_string();
+            assert!(text.contains(expected), "{stderr} gave {text}");
+        }
+    }
+
+    #[test]
+    fn a_taken_encoder_session_is_worth_retrying() {
+        let busy = check(Some(1), false, Some("OpenEncodeSessionEx failed")).unwrap_err();
+        assert!(is_busy(&busy.context("encoding clip.mov")));
+
+        let broken = check(Some(1), false, Some("moov atom not found")).unwrap_err();
+        assert!(!is_busy(&broken));
     }
 }

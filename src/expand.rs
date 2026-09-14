@@ -64,14 +64,65 @@ fn dedup_key(path: &Path) -> String {
 }
 
 /// Every video in `dir`, for when the command line carries no pattern at all.
-pub fn videos_in(dir: &Path) -> Result<Vec<PathBuf>> {
-    let mut files: Vec<PathBuf> = fs::read_dir(dir)
-        .with_context(|| format!("cannot read {}", dir.display()))?
-        .filter_map(|entry| entry.ok().map(|e| e.path()))
-        .filter(|path| path.is_file() && is_video(path) && !is_squish_output(path))
-        .collect();
+pub fn videos_in(dir: &Path, recursive: bool) -> Result<Vec<PathBuf>> {
+    let mut files = Vec::new();
+    let entries = fs::read_dir(dir).with_context(|| format!("cannot read {}", dir.display()))?;
+    gather(entries, recursive, &mut files);
     files.sort();
     Ok(files)
+}
+
+/// Directories that cannot be read are stepped over: one unreadable folder
+/// somewhere in a tree should not cancel the whole run.
+fn gather(entries: fs::ReadDir, recursive: bool, files: &mut Vec<PathBuf>) {
+    for path in entries.filter_map(|entry| entry.ok().map(|e| e.path())) {
+        // A symlink pointing back up the tree would otherwise loop forever.
+        let Ok(meta) = fs::symlink_metadata(&path) else {
+            continue;
+        };
+        if meta.is_dir() {
+            if recursive && !is_hidden(&path) {
+                if let Ok(entries) = fs::read_dir(&path) {
+                    gather(entries, recursive, files);
+                }
+            }
+        } else if meta.is_file() && is_video(&path) && !is_squish_output(&path) {
+            files.push(path);
+        }
+    }
+}
+
+fn is_hidden(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|n| n.to_str())
+        .is_some_and(|name| name.starts_with('.'))
+}
+
+/// With `-r` a pattern covers the whole tree, so `*.mov` means `**/*.mov`.
+pub fn into_recursive(pattern: &str) -> String {
+    let normalized = normalize_separators(pattern);
+    if normalized.contains("**") {
+        return normalized;
+    }
+    match normalized.rsplit_once('/') {
+        Some((dir, file)) => format!("{dir}/**/{file}"),
+        None => format!("**/{normalized}"),
+    }
+}
+
+/// The deepest directory holding every input, so `--out-dir` can keep the shape
+/// of the tree it was given.
+pub fn common_base(inputs: &[PathBuf]) -> Option<PathBuf> {
+    let mut base = inputs.first()?.parent()?.to_path_buf();
+    for input in inputs.iter().skip(1) {
+        let parent = input.parent()?;
+        while !parent.starts_with(&base) {
+            if !base.pop() {
+                return None;
+            }
+        }
+    }
+    Some(base)
 }
 
 fn is_video(path: &Path) -> bool {
@@ -81,19 +132,29 @@ fn is_video(path: &Path) -> bool {
         .is_some_and(|ext| VIDEO_EXTENSIONS.contains(&ext.as_str()))
 }
 
-/// `clip.mov` next to `out_dir` becomes `clip.squish.mp4`.
-pub fn output_path(input: &Path, out_dir: Option<&Path>) -> Result<PathBuf> {
+/// `clip.mov` next to `out_dir` becomes `clip.squish.mp4`. Under `--out-dir`,
+/// whatever of the input's path lies below `base` is recreated there.
+pub fn output_path(input: &Path, out_dir: Option<&Path>, base: Option<&Path>) -> Result<PathBuf> {
     let stem = input
         .file_stem()
         .with_context(|| format!("{} has no file name", input.display()))?;
     let mut name = stem.to_os_string();
     name.push(format!(".{OUTPUT_MARKER}.{OUTPUT_EXTENSION}"));
 
-    let dir = out_dir
-        .map(Path::to_path_buf)
-        .or_else(|| input.parent().map(Path::to_path_buf))
-        .unwrap_or_default();
+    let dir = match out_dir {
+        Some(out) => out.join(below(input, base)),
+        None => input.parent().map(Path::to_path_buf).unwrap_or_default(),
+    };
     Ok(dir.join(name))
+}
+
+fn below(input: &Path, base: Option<&Path>) -> PathBuf {
+    let Some(parent) = input.parent() else {
+        return PathBuf::new();
+    };
+    base.and_then(|base| parent.strip_prefix(base).ok())
+        .map(Path::to_path_buf)
+        .unwrap_or_default()
 }
 
 /// Outputs of an earlier run, so `squish *.mp4` does not eat its own results.
@@ -133,20 +194,114 @@ mod tests {
 
     #[test]
     fn output_name_sits_next_to_the_source() {
-        let out = output_path(Path::new("clip.mov"), None).unwrap();
+        let out = output_path(Path::new("clip.mov"), None, None).unwrap();
         assert_eq!(out, PathBuf::from("clip.squish.mp4"));
     }
 
     #[test]
     fn output_name_keeps_inner_dots_and_the_directory() {
-        let out = output_path(Path::new("/videos/my.clip.MOV"), None).unwrap();
+        let out = output_path(Path::new("/videos/my.clip.MOV"), None, None).unwrap();
         assert_eq!(out, PathBuf::from("/videos/my.clip.squish.mp4"));
     }
 
     #[test]
     fn out_dir_moves_the_output() {
-        let out = output_path(Path::new("/videos/clip.mov"), Some(Path::new("/tmp/enc"))).unwrap();
+        let out = output_path(
+            Path::new("/videos/clip.mov"),
+            Some(Path::new("/tmp/enc")),
+            None,
+        )
+        .unwrap();
         assert_eq!(out, PathBuf::from("/tmp/enc/clip.squish.mp4"));
+    }
+
+    #[test]
+    fn out_dir_rebuilds_the_tree_under_the_base() {
+        let out = output_path(
+            Path::new("/videos/2024/may/clip.mov"),
+            Some(Path::new("/tmp/enc")),
+            Some(Path::new("/videos")),
+        )
+        .unwrap();
+        assert_eq!(out, PathBuf::from("/tmp/enc/2024/may/clip.squish.mp4"));
+
+        let flat = output_path(
+            Path::new("/videos/clip.mov"),
+            Some(Path::new("/tmp/enc")),
+            Some(Path::new("/videos")),
+        )
+        .unwrap();
+        assert_eq!(flat, PathBuf::from("/tmp/enc/clip.squish.mp4"));
+    }
+
+    #[test]
+    fn a_base_that_does_not_fit_leaves_the_output_flat() {
+        let out = output_path(
+            Path::new("/elsewhere/clip.mov"),
+            Some(Path::new("/tmp/enc")),
+            Some(Path::new("/videos")),
+        )
+        .unwrap();
+        assert_eq!(out, PathBuf::from("/tmp/enc/clip.squish.mp4"));
+    }
+
+    #[test]
+    fn the_base_is_the_deepest_shared_directory() {
+        let paths = |list: &[&str]| list.iter().map(PathBuf::from).collect::<Vec<_>>();
+        assert_eq!(
+            common_base(&paths(&["/a/b/one.mov", "/a/b/c/two.mov"])),
+            Some(PathBuf::from("/a/b"))
+        );
+        assert_eq!(
+            common_base(&paths(&["/a/b/one.mov", "/a/d/two.mov"])),
+            Some(PathBuf::from("/a"))
+        );
+        assert_eq!(
+            common_base(&paths(&["/a/one.mov"])),
+            Some(PathBuf::from("/a"))
+        );
+        assert_eq!(common_base(&[]), None);
+    }
+
+    #[test]
+    fn a_recursive_pattern_reaches_into_subdirectories() {
+        assert_eq!(into_recursive("*.mov"), "**/*.mov");
+        assert_eq!(into_recursive("clips/*.mov"), "clips/**/*.mov");
+        assert_eq!(into_recursive("clips/**/*.mov"), "clips/**/*.mov");
+    }
+
+    #[test]
+    fn a_recursive_pattern_matches_here_as_well_as_deeper() {
+        let dir = tempdir().unwrap();
+        fs::create_dir_all(dir.path().join("a").join("b")).unwrap();
+        fs::write(dir.path().join("top.mov"), b"x").unwrap();
+        fs::write(dir.path().join("a").join("mid.mov"), b"x").unwrap();
+        fs::write(dir.path().join("a").join("b").join("deep.mov"), b"x").unwrap();
+
+        let pattern = into_recursive(&pattern_in(dir.path(), "*.mov"));
+        let files = expand_patterns(&[pattern]).unwrap();
+        assert_eq!(as_string(&files), ["deep.mov", "mid.mov", "top.mov"]);
+    }
+
+    #[test]
+    fn a_bare_directory_can_be_walked_down() {
+        let dir = tempdir().unwrap();
+        fs::create_dir_all(dir.path().join("sub").join("deeper")).unwrap();
+        fs::create_dir(dir.path().join(".hidden")).unwrap();
+        fs::write(dir.path().join("top.mov"), b"x").unwrap();
+        fs::write(dir.path().join("sub").join("mid.mp4"), b"x").unwrap();
+        fs::write(dir.path().join("sub").join("old.squish.mp4"), b"x").unwrap();
+        fs::write(dir.path().join("sub").join("deeper").join("deep.mkv"), b"x").unwrap();
+        fs::write(dir.path().join(".hidden").join("secret.mov"), b"x").unwrap();
+
+        assert_eq!(
+            as_string(&videos_in(dir.path(), false).unwrap()),
+            ["top.mov"]
+        );
+        assert_eq!(
+            as_string(&videos_in(dir.path(), true).unwrap()),
+            ["deep.mkv", "mid.mp4", "top.mov"]
+        );
     }
 
     #[test]
@@ -173,7 +328,7 @@ mod tests {
         }
         fs::create_dir(dir.path().join("sub.mov")).unwrap();
 
-        let files = videos_in(dir.path()).unwrap();
+        let files = videos_in(dir.path(), false).unwrap();
         assert_eq!(as_string(&files), ["a.mov", "b.MP4", "c.mkv"]);
     }
 

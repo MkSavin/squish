@@ -1,0 +1,26 @@
+# yaml-language-server: $schema=https://aka.ms/winget-manifest.defaultLocale.1.6.0.schema.json
+PackageIdentifier: MkSavin.Squish
+PackageVersion: 0.1.0
+PackageLocale: en-US
+Publisher: MkSavin
+PublisherUrl: https://github.com/MkSavin
+PackageName: squish
+PackageUrl: https://github.com/MkSavin/squish
+License: MIT
+LicenseUrl: https://github.com/MkSavin/squish/blob/main/LICENSE
+ShortDescription: Batch video re-encoder on top of ffmpeg
+Description: >-
+  squish re-encodes a whole folder of video with one command. It expands its own
+  globs, reads each file with ffprobe to pick a profile and a pixel format the
+  encoder accepts, encodes several files at once on the GPU, checks the results
+  and never touches the originals.
+Moniker: squish
+Tags:
+  - ffmpeg
+  - nvenc
+  - video
+  - transcode
+  - cli
+ReleaseNotesUrl: https://github.com/MkSavin/squish/releases/tag/v0.1.0
+ManifestType: defaultLocale
+ManifestVersion: 1.6.0
