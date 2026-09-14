@@ -1,0 +1,115 @@
+name: release
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # Keeps a "release PR" open with the next version and the changelog entries
+  # collected from conventional commits. Merging it is what triggers a release.
+  release-pr:
+    runs-on: ubuntu-latest
+    concurrency:
+      group: release-pr-${{ github.ref }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: release-plz/action@v0.5.117
+        with:
+          command: release-pr
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  release:
+    runs-on: ubuntu-latest
+    outputs:
+      created: ${{ steps.release-plz.outputs.releases_created }}
+      tag: ${{ fromJSON(steps.release-plz.outputs.releases || '[{}]')[0].tag }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+      - id: release-plz
+        uses: release-plz/action@v0.5.117
+        with:
+          command: release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  # Same workflow run as the release job, so the binaries reach the release that
+  # was just created — a tag pushed by GITHUB_TOKEN would not start a new run.
+  build:
+    needs: release
+    if: needs.release.outputs.created == 'true'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+          - os: macos-latest
+            target: aarch64-apple-darwin
+    runs-on: ${{ matrix.os }}
+    env:
+      TAG: ${{ needs.release.outputs.tag }}
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.release.outputs.tag }}
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+      - run: cargo test --locked --target ${{ matrix.target }}
+      - run: cargo build --release --locked --target ${{ matrix.target }}
+
+      - name: Package (windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $name = "squish-$env:TAG-${{ matrix.target }}"
+          New-Item -ItemType Directory -Force dist/$name | Out-Null
+          Copy-Item target/${{ matrix.target }}/release/squish.exe dist/$name/
+          Copy-Item README.md, LICENSE, CHANGELOG.md dist/$name/
+          Compress-Archive -Path dist/$name -DestinationPath dist/$name.zip
+          (Get-FileHash dist/$name.zip -Algorithm SHA256).Hash.ToLower() |
+            Set-Content dist/$name.zip.sha256
+
+      - name: Package (unix)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          name="squish-$TAG-${{ matrix.target }}"
+          mkdir -p "dist/$name"
+          cp target/${{ matrix.target }}/release/squish "dist/$name/"
+          cp README.md LICENSE CHANGELOG.md "dist/$name/"
+          tar -czf "dist/$name.tar.gz" -C dist "$name"
+          # macOS ships shasum, Linux ships sha256sum.
+          if command -v sha256sum >/dev/null; then
+            sha256sum "dist/$name.tar.gz" | cut -d' ' -f1 > "dist/$name.tar.gz.sha256"
+          else
+            shasum -a 256 "dist/$name.tar.gz" | cut -d' ' -f1 > "dist/$name.tar.gz.sha256"
+          fi
+
+      - name: Attach to the release
+        shell: bash
+        run: |
+          shopt -s nullglob
+          files=(dist/*.zip dist/*.tar.gz dist/*.sha256)
+          gh release upload "$TAG" "${files[@]}" --clobber
